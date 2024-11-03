@@ -104,7 +104,6 @@ int PioDCOInit(PioDco *pdco, int gpio, int cpuclkhz)
     sm_config_set_fifo_join(&pdco->_pio_sm, PIO_FIFO_JOIN_TX);
     sm_config_set_set_pins(&pdco->_pio_sm, pdco->_gpio, 4);         // 4 RF output pins. changed Sept 4 2024
     sm_config_set_sideset_pins(&pdco->_pio_sm, pdco->_gpio);        // sideset pins                       
-    
     pio_sm_init(pdco->_pio, pdco->_ism, pdco->_offset, &pdco->_pio_sm);
 
     return 0;

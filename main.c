@@ -33,6 +33,7 @@
 
 
 WSPRbeaconContext *pWSPR;
+WSPRbeaconContext *pWB;
 
 char _callsign[7];        //these get set via terminal, and then from NVRAM on boot
 char _id13[3];
@@ -40,13 +41,18 @@ char _start_minute[2];
 char _lane[2];
 char _suffix[2];
 char _verbosity[2];
+// this isn't modifiable by user but still checked for correct default value
 char _oscillator[2];
 char _custom_PCB[2];   
-char _TELEN_config[5];     
+char _TELEN_config[5]; 
 char _battery_mode[2];
 char _Klock_speed[4];         
 char _Datalog_mode[2]; 
 char _U4B_chan[4];
+//**********
+// kevin 10_30_24
+char _Band[3]; // string with 10, 12, 15, 17, 20 legal. null at end
+//**********
 
 static uint32_t telen_values[4];  //consolodate in an array to make coding easier
 static absolute_time_t LED_sequence_start_time;
@@ -66,6 +72,61 @@ OW one_wire_interface;   //onewire interface
 
 PioDco DCO = {0};
 
+// 0 should never happen (init_rf_freq will always init from saved nvram/live state)
+uint32_t XMIT_FREQUENCY=0;
+
+//*******************************
+uint32_t init_rf_freq(void)
+{
+// kevin 10_30_24
+// base frequencies for different bands
+// the pico should be able to do up to 10M band with appropriate clock frequency? (250Mhz? or ??)
+// 136000, 474200, 1836600, 3568600, 5364700, 7038600, 10138700, 14095600, 18104600, 21094600, 24924600, 28124600, 50293000, 70091000, 144489000};
+// will support 20M, 17M, 15M, 12M, 10M
+
+enum BASE_FREQS {
+    BF20M=14095600UL,
+    BF17M=18104600UL,
+    BF15M=21094600UL,
+    BF12M=24924600UL,
+    BF10M=28124600UL
+};
+
+uint32_t BASE_FREQ_USED;
+switch(atoi(_Band))
+{
+    case 20: BASE_FREQ_USED=BF20M; break;
+    case 17: BASE_FREQ_USED=BF17M; break;
+    case 15: BASE_FREQ_USED=BF15M; break;
+    case 12: BASE_FREQ_USED=BF12M; break;
+    case 10: BASE_FREQ_USED=BF10M; break;
+    default: BASE_FREQ_USED=BF20M; // default to 20M in case of error cases
+}
+
+XMIT_FREQUENCY=BASE_FREQ_USED + 1400UL; // offset from base for start of passband. same for all bands
+
+// add offset based on lane ..same for every band
+switch(_lane[0])                                     
+    // Center frequency for Zachtek (wspr 3) is hard set in WSPRBeacon.c to 14097100UL
+    {
+        // old code for 20M:
+        // case '1':XMIT_FREQUENCY=14097020UL; break;
+        // case '2':XMIT_FREQUENCY=14097060UL; break;
+        // case '3':XMIT_FREQUENCY=14097140UL; break;
+        // case '4':XMIT_FREQUENCY=14097180UL; break;
+        // default: XMIT_FREQUENCY=14097100UL; // in case invalid lane was read from EEPROM. This is center passband?? (not a valid lane?)
+        // new code:
+        case '1':XMIT_FREQUENCY+=20UL;  break;
+        case '2':XMIT_FREQUENCY+=60UL;  break;
+        case '3':XMIT_FREQUENCY+=140UL; break;
+        case '4':XMIT_FREQUENCY+=180UL; break;
+        default: XMIT_FREQUENCY+=100UL; // in case invalid lane was read from EEPROM. This is center passband?? (not a valid lane?)
+    }	
+
+printf("\nrf_freq_init _Band %s BASE_FREQ_USED %d XMIT_FREQUENCY %d _Klock_speed %s\n", _Band, BASE_FREQ_USED, XMIT_FREQUENCY, _Klock_speed);
+    return XMIT_FREQUENCY;
+}
+//**************************
 
 int main()
 {
@@ -81,12 +142,17 @@ int main()
         gpio_put(LED_PIN, 0);
 		sleep_ms(100);
 	}
-	read_NVRAM();				//reads values of _callsign,  _verbosity etc from NVRAM. MUST READ THESE *BEFORE* InitPicoPins
-if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds and reboot. or if user presses a key enter setup
+	read_NVRAM(); //reads values of _callsign,  _verbosity etc from NVRAM. MUST READ THESE *BEFORE* InitPicoPins
+    //************
+    // kevin 10_31_24 ..actually change to defaults if any bad found..to avoid hang cases caused by illegal values
+    // after "too high clock" recovery with flash nuke uf2, and clock gets fixed, this will fix other values to legal defaults
+    // if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds and reboot. or if user presses a key enter setup
+    if (check_data_validity_and_set_defaults()==-1)  //if data was bad (and got fixed!) , breathe LED for 10 seconds and reboot. or if user presses a key enter setup
+    //************
 	{
-	printf("\nBAD values in NVRAM detected! will reboot in 10 seconds... press any key to enter user-setup menu..\n");
-	fader=0;fade_counter=0;
-			while (getchar_timeout_us(0)==PICO_ERROR_TIMEOUT) //looks for input on USB serial port only @#$%^&!! they changed this function in SDK 2.0!. used to use -1 for no input, now its -2 PICO_ERROR_TIMEOUT
+	    printf("\nBAD values in NVRAM detected! will reboot in 10 seconds... press any key to enter user-setup menu..\n");
+	    fader=0;fade_counter=0;
+        while (getchar_timeout_us(0)==PICO_ERROR_TIMEOUT) //looks for input on USB serial port only @#$%^&!! they changed this function in SDK 2.0!. used to use -1 for no input, now its -2 PICO_ERROR_TIMEOUT
 			{
 			 fader+=1;
 			 if ((fader%5000)>(fader/100))
@@ -106,26 +172,34 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 	process_chan_num(); //sets minute/lane/id from chan number. usually redundant at this point, but can't hurt
 	
 	if (getchar_timeout_us(0)>0)   //looks for input on USB serial port only. Note: getchar_timeout_us(0) returns a -2 (as of sdk 2) if no keypress. Must do this check BEFORE setting Clock Speed in Case you bricked it
-		{
+    {
 		DCO._pGPStime->user_setup_menu_active=1;	
 		user_interface();   
-		}
-	InitPicoClock(PLL_SYS_MHZ);			    // Sets the system clock generator	
+    }
+    //***************
+    // kevin 10_31_24
+	if (InitPicoClock(PLL_SYS_MHZ)==-1) // Tries to set the system clock generator	
+    {
+        // example of bad _Klock_speed is 205
+        printf("FAILED with PLL_SYS_MHZ %d trying to reset _Klock_speed (and NVRAM) to default 115", PLL_SYS_MHZ);
+	    strcpy(_Klock_speed,"115"); 
+        write_NVRAM();
+        PLL_SYS_MHZ = 115;
+	    InitPicoClock(PLL_SYS_MHZ);	// This should work now
+    }
+    // don't have to redo if it passed the first time
+    //***************
+        
 	InitPicoPins();				// Sets GPIO pins roles and directions and also ADC for voltage and temperature measurements (NVRAM must be read BEFORE this, otherwise dont know how to map IO)
 	I2C_init();
     printf("\nThe pico-WSPRer version: %s %s\nWSPR beacon init...",__DATE__ ,__TIME__);	//messages are sent to USB serial port, 115200 baud
 
-	uint32_t XMIT_FREQUENCY;
-	switch(_lane[0])                                     //following lines set lane frequencies for 20M u4b operation. The center freuency for Zactkep (wspr 3) xmitions is hard set in WSPRBeacon.c to 14097100UL
-		{
-			case '1':XMIT_FREQUENCY=14097020UL;break;
-			case '2':XMIT_FREQUENCY=14097060UL;break;
-			case '3':XMIT_FREQUENCY=14097140UL;break;
-			case '4':XMIT_FREQUENCY=14097180UL;break;
-			default: XMIT_FREQUENCY=14097100UL;        //in case an invalid lane was read from EEPROM
-		}	
-   
-	 WSPRbeaconContext *pWB = WSPRbeaconInit(
+    //*******************************
+    // kevin 10_31_24
+    uint32_t XMIT_FREQUENCY;
+    XMIT_FREQUENCY = init_rf_freq();
+
+    pWB = WSPRbeaconInit(
         _callsign,/** the Callsign. */
         CONFIG_LOCATOR4,/**< the default QTH locator if GPS isn't used. */
         10,             /**< Tx power, dbm. */
@@ -134,10 +208,10 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
         0,           /**< the carrier freq. shift relative to dial freq. */ //not used
         RFOUT_PIN,       /**< RF output GPIO pin. */
 		(uint8_t)_start_minute[0]-'0',   /**< convert ASCI digits to ints  */
-		(uint8_t)_id13[0]-'0',   
-		(uint8_t)_suffix[0]-'0',
+		(uint8_t)_id13[0]-'0',   (uint8_t)_suffix[0]-'0',
 		_TELEN_config		
         );
+
     assert_(pWB);
     pWSPR = pWB;  //this lets things outside this routine access the WB context
     pWB->_txSched.force_xmit_for_testing = force_transmit;
@@ -160,27 +234,42 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 	LED_sequence_start_time = get_absolute_time();
 	if (_Datalog_mode[0]=='1') datalog_loop();
 	
+    absolute_time_t loop_us_start;
+    absolute_time_t loop_us_end;
+    int64_t loop_us_elapsed;
+    int64_t loop_ms_elapsed;
+
+    // copied from loop_us_end while in the loop (at bottom)
+    loop_us_start = get_absolute_time();
     for(;;)   //loop every ~ half second
     {		
+
 		onewire_read();
 		I2C_read();
 		
 		if(WSPRbeaconIsGPSsolutionActive(pWB))
         {
-            const char *pgps_qth = WSPRbeaconGetLastQTHLocator(pWB);  //GET MAIDENHEAD       - this code in original fork wasnt working due to error in WSPRbeacon.c
+            const char *pgps_qth = WSPRbeaconGetLastQTHLocator(pWB);  //GET MAIDENHEAD - this code in original fork wasnt working due to error in WSPRbeacon.c
             if(pgps_qth)
             {
-                strncpy(pWB->_pu8_locator, pgps_qth, 6);     //does full 6 char maidenhead 				
-//		        strcpy(pWB->_pu8_locator,"AA1ABC");          //DEBUGGING TO FORCE LOCATOR VALUE				
+                strncpy(pWB->_pu8_locator, pgps_qth, 6); //does full 6 char maidenhead 				
+                // strcpy(pWB->_pu8_locator,"AA1ABC");   //DEBUGGING TO FORCE LOCATOR VALUE				
             }
         }        
         WSPRbeaconTxScheduler(pWB, YES, GPS_PPS_PIN);   
                 
+        tick = tick + 1;
 		if (pWB->_txSched.verbosity>=5)
 		{
-				if(0 == ++tick % 20)      //every ~20 secs dumps context.  
-				 WSPRbeaconDumpContext(pWB);
-		}	
+            if(0==(tick % 20)) // every ~20 * 0.5 = 10 secs
+            {
+                WSPRbeaconDumpContext(pWB);
+                //****************
+                // kevin 10_30_24
+                StampPrintf("\n_Band %s _lane (u4b freq bin) %s XMIT_FREQUENCY %d\n", _Band, _lane[0], XMIT_FREQUENCY);
+                //****************
+            }
+        }	
 
 		if (getchar_timeout_us(0)>0)   //looks for input on USB serial port only. Note: getchar_timeout_us(0) returns a -2 (as of sdk 2) if no keypress. But if you force it into a Char type, becomes something else
 		{
@@ -192,27 +281,67 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 		adc_select_input(4);	
 		float adc = (float)adc_read() * conversionFactor;
 		float tempC = 27.0f - (adc - 0.706f) / 0.001721f;		
-		if (tempC < -50) { tempC  += 89; }			          //wrap around for overflow, per U4B protocol
-		if (tempC > 39) { tempC  -= 89; }
+        
+        // don't really want this? modulo arith is done before using for wspr encoding
+		// if (tempC < -50) { tempC  += 89; }			          //wrap around for overflow, per U4B protocol
+		// if (tempC > 39) { tempC  -= 89; }
+        // should be 1 deg C granularity..but maybe leave it with more precision for seeing small temp changes in the stdout
 		pWB->_txSched.temp_in_Celsius=tempC;           
 		DCO._pGPStime->temp_in_Celsius=tempC;
 		
 		adc_select_input(3);  //if setup correctly, ADC3 reads Vsys   // read voltage
-		float volts = 3*(float)adc_read() * conversionFactor;         //times 3 because of onboard voltage divider
-			if (volts < 3.00) { volts += 1.95; }			          //wrap around for overflow, per U4B protocol
-			if (volts > 4.95) { volts -= 1.95; }
+		float volts_adc = 3*(float)adc_read() * conversionFactor;     // times 3 because of onboard voltage divider
+        //*****************
+        // kevin 10_30_24
+        // make volts just valid multiple of 0.05 (aligns with u4b granularity)
+        int v = volts_adc * 100; 
+        // floor divide because int
+        v = (v / 5) * 5;
+        float volts = v / 100;
+        //*****************
+        // don't really want this? modulo arith is done before using for wspr encoding
+        // if (volts < 3.00) { volts += 1.95; } //wrap around for overflow, per U4B protocol
+        // if (volts > 4.95) { volts -= 1.95; }
 		pWB->_txSched.voltage=volts;
 
  		process_TELEN_data();                          //if needed, this puts data into TELEN variables. You can remove this and set the data yourself as shown in the next two lines
 		//pWB->_txSched.TELEN1_val1=rand() % 630000;   //the values  in TELEN_val1 and TELEN_val2 will get sent as TELEN #1 (extended Telemetry) (a third packet in the U4B protocol)
-		//pWB->_txSched.TELEN1_val2=rand() % 153000;	/ max values are 630k and 153k
+		//pWB->_txSched.TELEN1_val2=rand() % 153000;	//max values are 630k and 153k
 		
 				
-				if(0 == ++tick2 % 10)      //every ~5 sec
-				{
-				if (pWB->_txSched.verbosity>=1) StampPrintf("Temp: %0.1f  Volts: %0.1f  Altitude: %0.0f  Satellite count: %d\n", tempU,volts,DCO._pGPStime->_altitude ,DCO._pGPStime->_time_data.sat_count);		
-				if (pWB->_txSched.verbosity>=3) printf("TELEN Vals 1 through 4:  %d %d %d %d\n",telen_values[0],telen_values[1],telen_values[2],telen_values[3]);
-				}
+        if(0==(tick % 10)) // every ~10 * 0.5 = 5 secs
+        {
+            //********************
+            // kevin 10_30_24 changed volts to 2 digits of precision (to see 0.05 0.10 0.15 etc)
+            // only valid 0.05 increments forced above
+            // should temp be aligned to single digit degrees above?..
+            // maybe allow more precision in stdout compared to telemetry
+
+            // example stdout running on usb. this will print 5.00v, 
+            // 00d00:00:40.599513 [0065] Temp: 86.0  Volts: 5.00  Altitude: 2368  Satellite count: 13
+            // but: telemetry will wrap and say 3.00v when decoded.  
+            // 4.95v is max no-wrap report for u4b/traquito 3-4.95v range assumption)
+
+            // grab/save grid to see if 2d gps changes..only valid fixes?
+            char pWB_grid6[7] = "------";
+		    // if(WSPRbeaconIsGPSsolutionActive(pWB))
+            // FIX! should I just look at pWB data all the time? doesn't matter if gps fix is realtime good fix?
+            if (DCO._pGPStime->_time_data._u8_is_solution_active)
+            {
+                strncpy( pWB_grid6, pWB->_pu8_locator, 6);
+                pWB_grid6[6] = 0; // null term
+            }
+
+            // FIX! in WSPRbeacon.c...why isn't altitude captured when grid is captured, for the two transmissions. Or is it?
+            // why is this grabbed from gpstime.c (altitude_snapshot) rather than capturing it in pWB at the same time as grid?
+            // this is a live altitude which can change during transmission?
+            if (pWB->_txSched.verbosity>=1) 
+                StampPrintf("Temp: %.1f  Volts: %0.2f  Altitude: %0.0f  Satellite count: %d pWB_grid6: %s\n", tempU,volts,DCO._pGPStime->_altitude, DCO._pGPStime->_time_data.sat_count, pWB_grid6);
+
+            //********************
+            if (pWB->_txSched.verbosity>=3) 
+                printf("TELEN Vals 1 through 4:  %d %d %d %d\n",telen_values[0],telen_values[1],telen_values[2],telen_values[3]);
+        }
 		
 		for (int i=0;i < 10;i++) //orig code had a 900mS pause here. I only pause a total of 500ms, and spend it polling the time to handle LED state
 			{
@@ -220,6 +349,38 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 				sleep_ms(50); 
 			}
 		DoLogPrint(); 	
+        //***************
+        // kevin 10_31_24 FIX! put in a conditional delay that depends on clock frequency
+        // faster cpu clock will want more delay? (won't affect the PIO block doing RF)
+        // time the loop
+
+        // static uint64_t to_us_since_boot	( absolute_time_t t	)	
+        // convert an absolute_time_t into a number of microseconds since boot.
+        //****************
+        
+        loop_us_end = get_absolute_time();
+        loop_us_elapsed = absolute_time_diff_us(loop_us_start, loop_us_end);
+        // floor divide to get milliseconds
+        loop_ms_elapsed = loop_us_elapsed / 1000ULL;
+
+		if (pWB->_txSched.verbosity>=5)
+		{
+            if(0==(tick % 20)) // every ~20 * 0.5 = 10 secs
+            {
+                StampPrintf("main/20: _Band %s loop_ms_elapsed: %d millisecs loop_us_start: %llu microsecs loop_us_end: %llu microsecs", _Band, loop_ms_elapsed, loop_us_start, loop_us_end);
+            }
+        }	
+
+        // next start is this end
+        loop_us_start = loop_us_end;
+        // will always 0 or greater? (unless bug with time)
+        /*
+        if ((loop_ms_elapsed < 500) && (loop_ms_elapsed > 0)) {
+	        sleep_ms(500 - loop_ms_elapsed);
+            
+        }
+        */
+        //****************
 	}
 }
 ///////////////////////////////////
@@ -232,7 +393,7 @@ void process_TELEN_data(void)
 		const float conversionFactor = 3300.0f / (1 << 12);   //3.3 * 1000. the 3.3 is from vref, the 1000 is to convert to mV. the 12 bit shift is because thats resolution of ADC
 
 		for (int i=0;i < 4;i++)
-		{			
+		{	 		
 		   switch(_TELEN_config[i])
 			{
 				case '-':  break; //do nothing, telen chan is disabled
@@ -346,7 +507,7 @@ printf("TELEN CONFIG INSTRUCTIONS:\n\n");printf(UNDERLINE_OFF);
 printf(NORMAL); 
 printf("* There are 4 possible TELEN values, corresponding to TELEN 1 value 1,\n");
 printf("  TELEN 1 value 2, TELEN 2 value 1 and TELEN 2 value 2.\n");
-printf("* Enter 4 characters in TELEN_config. use a '-' (minus) to disable one \n");
+printf("* Enter 4 characters (legal 0-9 or -) in TELEN_config. use a '-' (minus) to disable one \n");
 printf("  or more values.\n* example: '----' disables all telen \n");
 printf("* example: '01--' sets Telen 1 value 1 to type 0, \n  Telen 1 val 2 to type 1,  disables all of TELEN 2 \n"); printf(BRIGHT);printf(UNDERLINE_ON);
 printf("\nTelen Types:\n\n");printf(UNDERLINE_OFF);printf(NORMAL); 
@@ -390,7 +551,11 @@ show_values();          /* shows current VALUES  AND list of Valid Commands */
     for(;;)
 	{	
 																 printf(UNDERLINE_ON);printf(BRIGHT);
-		printf("\nEnter the command (X,C,S,U,[I,M,L],V,P,T,B,D,K,F):");printf(UNDERLINE_OFF);printf(NORMAL);	
+		// printf("\nEnter the command (X,C,S,U,[I,M,L],V,P,T,B,D,K,F):");printf(UNDERLINE_OFF);printf(NORMAL);	
+        //******
+        // kevin 10_30_24
+		printf("\nEnter the command (X,C,S,U,[I,M,L],V,P,T,B,D,K,F,A):");printf(UNDERLINE_OFF);printf(NORMAL);	
+        //
 		c=getchar_timeout_us(60000000);		   //just in case user setup menu was enterred during flight, this will reboot after 60 secs
 		printf("%c\n", c);
 		if (c==PICO_ERROR_TIMEOUT) {printf(CLEAR_SCREEN);printf("\n\n TIMEOUT WAITING FOR INPUT, REBOOTING FOR YOUR OWN GOOD!\n");sleep_ms(100);watchdog_enable(100, 1);for(;;)	{}}
@@ -406,6 +571,7 @@ show_values();          /* shows current VALUES  AND list of Valid Commands */
 			case 'M':get_user_input("Enter starting Minute: ", _start_minute, sizeof(_start_minute)); write_NVRAM(); break; //still possible but not listed or recommended. i suppose needed for when to start standalone beacon or Zachtek
 			case 'L':get_user_input("Enter Lane (1,2,3,4): ", _lane, sizeof(_lane)); write_NVRAM(); break; //still possible but not listed or recommended
 			case 'V':get_user_input("Verbosity level (0-9): ", _verbosity, sizeof(_verbosity)); write_NVRAM(); break;
+            // this isn't modifiable by user but still checked for correct default value
 			/*case 'O':get_user_input("Oscillator off (0,1): ", _oscillator, sizeof(_oscillator)); write_NVRAM(); break;*/
 			case 'P':get_user_input("custom Pcb mode (0,1): ", _custom_PCB, sizeof(_custom_PCB)); write_NVRAM(); break;
 			case 'T':show_TELEN_msg();get_user_input("TELEN config: ", _TELEN_config, sizeof(_TELEN_config)); convertToUpperCase(_TELEN_config); write_NVRAM(); break;
@@ -435,11 +601,23 @@ show_values();          /* shows current VALUES  AND list of Valid Commands */
 					pWSPR->_txSched.force_xmit_for_testing = YES;
 					return;  // returns to main loop
 				}
+            //********************
+            // kevin 10_30_24
+			case 'A':
+                    get_user_input("Enter Band (10,12,15,17,20): ", _Band, sizeof(_Band)); 
+                    // redo the channel selection if we change bands, since U4B definition changes per band 
+                    process_chan_num(); 
+                    write_NVRAM(); 
+                    init_rf_freq();
+                    XMIT_FREQUENCY = init_rf_freq();
+					pWSPR->_pTX->_u32_dialfreqhz = XMIT_FREQUENCY;
+                    break;
+            //********************
 			case 13:  break;
 			case 10:  break;
 			default: printf(CLEAR_SCREEN); printf("\nYou pressed: %c - (0x%02x), INVALID choice!! ",c,c);sleep_ms(1000);break;		
 		}
-		check_data_validity_and_set_defaults();
+		int result = check_data_validity_and_set_defaults();
 		show_values();
 	}
 }
@@ -456,21 +634,26 @@ const uint8_t *flash_target_contents = (const uint8_t *) (XIP_BASE + FLASH_TARGE
 
 print_buf(flash_target_contents, FLASH_PAGE_SIZE); //256
 
-strncpy(_callsign, flash_target_contents, 6);
-strncpy(_id13, flash_target_contents+6, 2);
-strncpy(_start_minute, flash_target_contents+8, 1);
-strncpy(_lane, flash_target_contents+9, 1);
-strncpy(_suffix, flash_target_contents+10, 1);
-strncpy(_verbosity, flash_target_contents+11, 1);
-strncpy(_oscillator, flash_target_contents+12, 1);
-strncpy(_custom_PCB, flash_target_contents+13, 1);
-strncpy(_TELEN_config, flash_target_contents+14, 4);
-strncpy(_battery_mode, flash_target_contents+18, 1);
+//***********
+// kevin 10_31_24 null terminate in case it's printf'ed with %s
+// FIX! shouldn't all of these (all chars) have null terminate?
+strncpy(_callsign, flash_target_contents, 6); _callsign[6]=0;
+strncpy(_id13, flash_target_contents+6, 2); _id13[2]=0;
+strncpy(_start_minute, flash_target_contents+8, 1); _start_minute[1]=0;
+strncpy(_lane, flash_target_contents+9, 1); _lane[1]=0;
+strncpy(_suffix, flash_target_contents+10, 1); _suffix[1]=0;
+strncpy(_verbosity, flash_target_contents+11, 1); _verbosity[1]=0;
+// this isn't modifiable by user but still written and checked for default value
+strncpy(_oscillator, flash_target_contents+12, 1); _oscillator[1]=0;
+strncpy(_custom_PCB, flash_target_contents+13, 1); _custom_PCB[1]=0;
+strncpy(_TELEN_config, flash_target_contents+14, 4); _TELEN_config[4]=0;
+strncpy(_battery_mode, flash_target_contents+18, 1); _battery_mode[1]=0;
 strncpy(_Klock_speed, flash_target_contents+19, 3); _Klock_speed[3]=0; //null terminate cause later will use atoi
 PLL_SYS_MHZ =atoi(_Klock_speed); 
-strncpy(_Datalog_mode, flash_target_contents+22, 1);
+strncpy(_Datalog_mode, flash_target_contents+22, 1); _Datalog_mode[1]=0;
 strncpy(_U4B_chan, flash_target_contents+23, 3); _U4B_chan[3]=0; //null terminate cause later will use atoi
-
+strncpy(_Band, flash_target_contents+26, 2); _Band[2]=0; //null terminate cause later will use atoi
+//***********
  
 }
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -489,6 +672,7 @@ void write_NVRAM(void)
 	strncpy(data_chunk+9,_lane, 1);
 	strncpy(data_chunk+10,_suffix, 1);
 	strncpy(data_chunk+11,_verbosity, 1);
+    // this isn't modifiable by user but still checked for correct default value
 	strncpy(data_chunk+12,_oscillator, 1);
 	strncpy(data_chunk+13,_custom_PCB, 1);
 	strncpy(data_chunk+14,_TELEN_config, 4);
@@ -496,6 +680,10 @@ void write_NVRAM(void)
 	strncpy(data_chunk+19,_Klock_speed, 3);
 	strncpy(data_chunk+22,_Datalog_mode, 1);
 	strncpy(data_chunk+23,_U4B_chan, 3);
+    //****************
+    // kevin 10_30_24
+	strncpy(data_chunk+26,_Band, 2);
+    //****************
 	
 
 	uint32_t ints = save_and_disable_interrupts();
@@ -510,23 +698,85 @@ void write_NVRAM(void)
  * and writes it back to NVRAM
  * 
  */
-void check_data_validity_and_set_defaults(void)
-{
-//do some basic plausibility checking on data, set reasonable defaults if memory was uninitialized							
-	if ( ((_callsign[0]<'A') || (_callsign[0]>'Z')) && ((_callsign[0]<'0') || (_callsign[0]>'9'))    ) {   strncpy(_callsign,"AB1CDE",6);     ; write_NVRAM();} 
-	if ( ((_suffix[0]<'0') || (_suffix[0]>'9')) && (_suffix[0]!='X') ) {_suffix[0]='-'; write_NVRAM();} //by default, disable zachtek suffix
-	if ( (_id13[0]!='0') && (_id13[0]!='1') && (_id13[0]!='Q')&& (_id13[0]!='-')) {strncpy(_id13,"Q0",2); write_NVRAM();}
-	if ( (_start_minute[0]!='0') && (_start_minute[0]!='2') && (_start_minute[0]!='4')&& (_start_minute[0]!='6')&& (_start_minute[0]!='8')) {_start_minute[0]='0'; write_NVRAM();}
-	if ( (_lane[0]!='1') && (_lane[0]!='2') && (_lane[0]!='3')&& (_lane[0]!='4')) {_lane[0]='2'; write_NVRAM();}
-	if ( (_verbosity[0]<'0') || (_verbosity[0]>'9')) {_verbosity[0]='1'; write_NVRAM();} //set default verbosity to 1
-	if ( (_oscillator[0]<'0') || (_oscillator[0]>'1')) {_oscillator[0]='1'; write_NVRAM();} //set default oscillator to switch off after the trasmission
-	if ( (_custom_PCB[0]<'0') || (_custom_PCB[0]>'1')) {_custom_PCB[0]='0'; write_NVRAM();} //set default IO mapping to original Pi Pico configuration
-	if ( (_TELEN_config[0]<'0') || (_TELEN_config[0]>'F')) {strncpy(_TELEN_config,"----",4); write_NVRAM();}
-	if ( (_battery_mode[0]<'0') || (_battery_mode[0]>'1')) {_battery_mode[0]='0'; write_NVRAM();} //
-	if ( (atoi(_Klock_speed)<100) || (atoi(_Klock_speed)>300)) {strcpy(_Klock_speed,"115"); write_NVRAM();} 
-	if ( (atoi(_U4B_chan)<0) || (atoi(_U4B_chan)>599)) {strcpy(_U4B_chan,"599"); write_NVRAM();} 
-	if ( (_Datalog_mode[0]!='0') && (_Datalog_mode[0]!='1') && (_Datalog_mode[0]!='D') && (_Datalog_mode[0]!='W')) {_Datalog_mode[0]='0'; write_NVRAM();}
 
+//*************************
+// kevin 10_31_24
+// int check_data_validity(void)
+// create result to return like check_data_validity does
+int check_data_validity_and_set_defaults(void)
+//*************************
+{
+    int result=1;	
+    //*************************
+    // kevin 10_31_24 
+    // do some basic plausibility checking on data, set reasonable defaults if memory was uninitialized							
+    // or has bad values for some reason
+    // create result to return like check_data_validity does
+    // FIX! should do full legal callsign check? (including spaces at end)
+    // be sure to null terminate so we can print the callsign
+	if ( ((_callsign[0]<'A') || (_callsign[0]>'Z')) && ((_callsign[0]<'0') || (_callsign[0]>'9')) ) {strcpy(_callsign,"AB1CDE"); write_NVRAM(); result=-1;} 
+    // kevin 10_31_24 didn't have the '-' in the ok check (check_data_availability did)
+	if ( ((_suffix[0]<'0') || (_suffix[0]>'9')) && (_suffix[0]!='-') && _suffix[0]!='X') {strcpy(_suffix,"-"); write_NVRAM(); result=-1;} //by default, disable zachtek suffix
+    // change to strcpy for null terminate
+	if ( (_id13[0]!='0') && (_id13[0]!='1') && (_id13[0]!='Q')&& (_id13[0]!='-')) {strcpy(_id13,"Q0"); write_NVRAM(); result=-1;}
+    // no null term added here, but a reboot will reload with null term for all now (see read_NVRAM)
+	if ( (_start_minute[0]!='0') && (_start_minute[0]!='2') && (_start_minute[0]!='4')&& (_start_minute[0]!='6')&& (_start_minute[0]!='8')) {strcpy(_start_minute,"0"); write_NVRAM(); result=-1;}
+	if ( (_lane[0]!='1') && (_lane[0]!='2') && (_lane[0]!='3')&& (_lane[0]!='4')) {strcpy(_lane,"2"); write_NVRAM(); result=-1;}
+	if ( (_verbosity[0]<'0') || (_verbosity[0]>'9')) {strcpy(_verbosity,"1"); write_NVRAM(); result=-1;} //set default verbosity to 1
+
+    // kevin 10_31_24 only allow 1 (oscillator off)..not in menu any more. 0 illegal. cover bad nvram
+	if ( (_oscillator[0]<'1') || (_oscillator[0]>'1')) {strcpy(_oscillator,"1"); write_NVRAM(); result=-1;} //set default oscillator to switch off after the transmission
+	if ( (_custom_PCB[0]<'0') || (_custom_PCB[0]>'1')) {strcpy(_custom_PCB,"0"); write_NVRAM(); result=-1;} //set default IO mapping to original Pi Pico configuration
+    // kevin 10_31_24 check_data_validity() allowed just [0] to be '-' and considered valid
+    // 0-9 and - are legal. _
+    // make sure to null terminate
+	if ( (_TELEN_config[0]<'0' || _TELEN_config[0]>'9') && _TELEN_config[0]!='-') {strcpy(_TELEN_config,"----"); write_NVRAM(); result=-1;}
+    // kevin 10_31_24 check the other 3 bytes also?
+	if ( (_TELEN_config[1]<'0' || _TELEN_config[1]>'9') && _TELEN_config[1]!='-') {strcpy(_TELEN_config,"----"); write_NVRAM(); result=-1;}
+	if ( (_TELEN_config[2]<'0' || _TELEN_config[2]>'9') && _TELEN_config[2]!='-') {strcpy(_TELEN_config,"----"); write_NVRAM(); result=-1;}
+	if ( (_TELEN_config[3]<'0' || _TELEN_config[3]>'9') && _TELEN_config[3]!='-')  {strcpy(_TELEN_config,"----"); write_NVRAM(); result=-1;}
+
+	if ( _battery_mode[0]<'0' || _battery_mode[0]>'1') {strcpy(_battery_mode,"0"); write_NVRAM(); result=-1;} //
+    
+    //*********
+    // kevin 10_31_24 . keep the upper limit at 250 to avoid nvram getting
+    // a freq that won't work. will have to load flash nuke uf2 to clear nram
+    // if that happens, so that default Klock will return?
+    // if so: Download the [UF2 file]
+    // https://datasheets.raspberrypi.com/soft/flash_nuke.uf2
+    // code is
+    // https://github.com/raspberrypi/pico-examples/blob/master/flash/nuke/nuke.c
+    // may require some iterations of manually setting all the configs by hand 
+    // after getting the nuke uf2 (it autoruns) and then reloading pico-WSPRer.uf2
+    // hmm. I suppose we could call this routine to fix nvram at the beginning, so if the 
+    // clock gets fixed, then the defaults will get fixed (where errors exist)
+    // be sure to null terminate
+	if ( (atoi(_Klock_speed)<100) || (atoi(_Klock_speed)>250)) {strcpy(_Klock_speed,"115"); write_NVRAM(); result=-1;} 
+    //*********
+	if ( (_Datalog_mode[0]!='0') && (_Datalog_mode[0]!='1') && (_Datalog_mode[0]!='D') && (_Datalog_mode[0]!='W')) {_Datalog_mode[0]='0'; write_NVRAM(); result=-1;}
+    // be sure to null terminate
+	if ( (atoi(_U4B_chan)<0) || (atoi(_U4B_chan)>599)) {strcpy(_U4B_chan,"599"); write_NVRAM(); result=-1;} 
+    //****************
+    // kevin 10_30_24
+    switch(atoi(_Band))
+    {
+        case 10: break;
+        case 12: break;
+        case 15: break;
+        case 17: break;
+        case 20: break;
+        default: 
+            strcpy(_Band,"20"); 
+            write_NVRAM(); 
+            // figure out the XMIT_FREQUENCY for new band, and set _32_dialfreqhz
+            // have to do this whenever we change bands
+            XMIT_FREQUENCY = init_rf_freq();
+		    pWSPR->_pTX->_u32_dialfreqhz = XMIT_FREQUENCY;
+            result=-1;
+            break;
+    }
+    return result;
+    //****************
 }
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -536,23 +786,43 @@ void check_data_validity_and_set_defaults(void)
  */
 int check_data_validity(void)
 {
-int result=1;	
-//do some basic plausibility checking on data				
-	if ( ((_callsign[0]<'A') || (_callsign[0]>'Z')) && ((_callsign[0]<'0') || (_callsign[0]>'9'))    ) {result=-1;} 
+    int result=1;	
+    //do some basic plausibility checking on data				
+	if ( ((_callsign[0]<'A') || (_callsign[0]>'Z')) && ((_callsign[0]<'0') || (_callsign[0]>'9')) ) {result=-1;} 
 	if ( ((_suffix[0]<'0') || (_suffix[0]>'9')) && (_suffix[0]!='-') && (_suffix[0]!='X') ) {result=-1;} 
 	if ( (_id13[0]!='0') && (_id13[0]!='1') && (_id13[0]!='Q')&& (_id13[0]!='-')) {result=-1;}
 	if ( (_start_minute[0]!='0') && (_start_minute[0]!='2') && (_start_minute[0]!='4')&& (_start_minute[0]!='6')&& (_start_minute[0]!='8')) {result=-1;}
 	if ( (_lane[0]!='1') && (_lane[0]!='2') && (_lane[0]!='3')&& (_lane[0]!='4')) {result=-1;}
 	if ( (_verbosity[0]<'0') || (_verbosity[0]>'9')) {result=-1;} 
-	if ( (_oscillator[0]<'0') || (_oscillator[0]>'1')) {result=-1;} 
+    // kevin 10_31_24 only allow 1 (oscillator off)..not in menu any more. 0 illegal. cover bad nvram
+	if ( (_oscillator[0]<'1') || (_oscillator[0]>'1')) {result=-1;} 
 	if ( (_custom_PCB[0]<'0') || (_custom_PCB[0]>'1')) {result=-1;} 
-	if ( ((_TELEN_config[0]<'0') || (_TELEN_config[0]>'F'))&& (_TELEN_config[0]!='-')) {result=-1;}
-	if ( (_battery_mode[0]<'0') || (_battery_mode[0]>'1')) {result=-1;} 	
-	if ( (atoi(_Klock_speed)<100) || (atoi(_Klock_speed)>300)) {result=-1;} 	
-	if ( (_Datalog_mode[0]!='0') && (_Datalog_mode[0]!='1')) {result=-1;}
-	if ( (atoi(_U4B_chan)<0) || (atoi(_U4B_chan)>599)) {result=-1;} 
+    // kevin 10_31_24 0-9 and - are legal
+	if ( (_TELEN_config[0]<'0' || _TELEN_config[0]>'9') && _TELEN_config[0]!='-') {result=-1;}
+    // kevin 10_31_24 check the 3 other bytes the same way
+	if ( (_TELEN_config[1]<'0' || _TELEN_config[1]>'9') && _TELEN_config[1]!='-') {result=-1;}
+	if ( (_TELEN_config[2]<'0' || _TELEN_config[2]>'9') && _TELEN_config[2]!='-') {result=-1;}
+	if ( (_TELEN_config[3]<'0' || _TELEN_config[3]>'9') && _TELEN_config[3]!='-') {result=-1;}
+	if ( _battery_mode[0]<'0' || _battery_mode[0]>'1') {result=-1;} 	
+    // kevin 10_31_24..make 250 the upper limit to avoid wedging the chip with unworkable freq
+	if ( (atoi(_Klock_speed)<100) || (atoi(_Klock_speed)>250)) {result=-1;} 	
+    // kevin 10_31_24 'D' and 'W' are also valid in check_data_validity_and_set_defaults()
+    if ( (_Datalog_mode[0]!='0') && (_Datalog_mode[0]!='1') && (_Datalog_mode[0]!='D') && (_Datalog_mode[0]!='W')) {result=-1;}
 
-return result;
+	if ( (atoi(_U4B_chan)<0) || (atoi(_U4B_chan)>599)) {result=-1;} 
+    //****************
+    // kevin 10_31_24
+    switch(atoi(_Band))
+    {
+        case 10: break;
+        case 12: break;
+        case 15: break;
+        case 17: break;
+        case 20: break;
+        default: result=-1;
+    }
+    //****************
+    return result;
 }
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /**
@@ -563,7 +833,6 @@ void show_values(void) /* shows current VALUES  AND list of Valid Commands */
 {
 								printf(CLEAR_SCREEN);printf(UNDERLINE_ON);printf(BRIGHT);
 printf("\n\nCurrent values:\n");printf(UNDERLINE_OFF);printf(NORMAL);
-
 printf("\n\tCallsign:%s\n\t",_callsign);
 printf("Suffix:%s\n\t",_suffix);
 printf("U4b channel:%s",_U4B_chan);
@@ -571,11 +840,17 @@ printf(" (Id13:%s",_id13);
 printf(" Start Minute:%s",_start_minute);
 printf(" Lane:%s)\n\t",_lane);
 printf("Verbosity:%s\n\t",_verbosity);
+// this isn't modifiable by user but still checked for correct default value
 /*printf("Oscillator Off:%s\n\t",_oscillator);*/
 printf("custom Pcb IO mappings:%s\n\t",_custom_PCB);
 printf("TELEN config:%s\n\t",_TELEN_config);
-printf("Klock speed:%sMhz  (default: 133)\n\t",_Klock_speed);
+printf("Klock speed:%sMhz  (default: 115)\n\t",_Klock_speed);
 printf("Datalog mode:%s\n\t",_Datalog_mode);
+//*************
+// kevin 10_30_24
+printf("Band:%s\n\t",_Band);
+printf("XMIT_FREQUENCY:%d\n\t",XMIT_FREQUENCY);
+//*************
 printf("Battery (low power) mode:%s\n\n",_battery_mode);
 
 							printf(UNDERLINE_ON);printf(BRIGHT);
@@ -584,13 +859,14 @@ printf("VALID commands: ");printf(UNDERLINE_OFF);printf(NORMAL);
 printf("\n\n\tX: eXit configuraiton and reboot\n\tC: change Callsign (6 char max)\n\t");
 printf("S: change Suffix ( for WSPR3/Zachtek) use '-' to disable WSPR3\n\t");
 printf("U: change U4b channel # (0-599)\n\t");
+printf("A: change bAnd (10,12,15,17,20 default 20)\n\t");
 /*printf("I: change Id13 (two alpha numeric chars, ie Q8) use '--' to disable U4B\n\t");
 printf("M: change starting Minute (0,2,4,6,8)\n\tL: Lane (1,2,3,4) corresponding to 4 frequencies in 20M band\n\t");*/ //it is still possible to directly change these, but its not shown
 printf("V: Verbosity level (0 for no messages, 9 for too many) \n\t");
-/*printf("O: Oscillator off after trasmission (default: 1) \n\t");*/
+/*printf("O: Oscillator off after transmission (default: 1) \n\t");*/
 printf("P: custom Pcb mode IO mappings (0,1)\n\t");
 printf("T: TELEN config\n\t");
-printf("K: Klock speed  (default: 133)\n\t");
+printf("K: Klock speed  (default: 115)\n\t");
 printf("D: Datalog mode (0,1,(W)ipe memory, (D)ump memory) see wiki\n\t");
 printf("B: Battery (low power) mode \n\t");
 printf("F: Frequency output (antenna tuning mode)\n\n");
@@ -632,18 +908,44 @@ void InitPicoPins(void)
 	gpio_for_onewire=ONEWIRE_bus_pin;
 	}
 	
-		else                          //if using custom PCB 
-		{	
-			gpio_for_onewire=ONEWIRE_bus_pin_pcb;
-			GPS_PPS_PIN = GPS_PPS_PIN_pcb;
-			RFOUT_PIN = RFOUT_PIN_pcb;
-			GPS_ENABLE_PIN = GPS_ENABLE_PIN_pcb;
-			gpio_init(GPS_ENABLE_PIN); gpio_set_dir(GPS_ENABLE_PIN, GPIO_OUT); //initialize GPS enable output (INVERSE LOGIC on custom PCB, so just initialize it, leave it at zero state)	
+    else                          //if using custom PCB 
+    {	
+    gpio_for_onewire=ONEWIRE_bus_pin_pcb;
+    GPS_PPS_PIN = GPS_PPS_PIN_pcb;
+    RFOUT_PIN = RFOUT_PIN_pcb;
+    GPS_ENABLE_PIN = GPS_ENABLE_PIN_pcb;
+    gpio_init(GPS_ENABLE_PIN); gpio_set_dir(GPS_ENABLE_PIN, GPIO_OUT); //initialize GPS enable output (INVERSE LOGIC on custom PCB, so just initialize it, leave it at zero state)	
 
-			gpio_init(6); gpio_set_dir(6, GPIO_OUT);gpio_put(6, 1); //these are required ONLY for v0.1 of custom PCB (ON/OFF and nReset of GPS module, which later are just left disconnected)
-			gpio_init(5); gpio_set_dir(5, GPIO_OUT);gpio_put(5, 1); //these are required ONLY for v0.1 of custom PCB (ON/OFF and nReset of GPS module, which later are just left disconnected)
-
+    gpio_init(6); gpio_set_dir(6, GPIO_OUT);gpio_put(6, 1); //these are required ONLY for v0.1 of custom PCB (ON/OFF and nReset of GPS module, which later are just left disconnected)
+    gpio_init(5); gpio_set_dir(5, GPIO_OUT);gpio_put(5, 1); //these are required ONLY for v0.1 of custom PCB (ON/OFF and nReset of GPS module, which later are just left disconnected)
 	}
+
+    //*****************
+    // kevin 11_1_24
+    // vary the rf out pins drive strength. use special test callsigns to decide
+    // from the pico sdk:
+    // enum gpio_drive_strength { GPIO_DRIVE_STRENGTH_2MA = 0, GPIO_DRIVE_STRENGTH_4MA = 1, GPIO_DRIVE_STRENGTH_8MA = 2, GPIO_DRIVE_STRENGTH_12MA = 3 }
+    enum gpio_drive_strength drive_strength;
+    if (_callsign == "R2MAD")  
+        drive_strength = GPIO_DRIVE_STRENGTH_2MA;
+    else if (_callsign == "R4MAD")  
+        drive_strength = GPIO_DRIVE_STRENGTH_4MA;
+    else if (_callsign == "R8MAD")  
+        drive_strength = GPIO_DRIVE_STRENGTH_8MA;
+    else if (_callsign == "R12MAD")  
+        drive_strength = GPIO_DRIVE_STRENGTH_12MA;
+    // can have alphanumerc in first 3 chars, alpha in last 3?  space can be in last 3? (telemetry doesn't use spac)e
+    else
+        // FIX! just force to 2MA always? (except for test cases above)
+        // drive_strength = GPIO_DRIVE_STRENGTH_2MA;
+        // default drive strength for everything else
+        drive_strength = GPIO_DRIVE_STRENGTH_8MA;
+
+    gpio_set_drive_strength(RFOUT_PIN+0, drive_strength);
+    gpio_set_drive_strength(RFOUT_PIN+1, drive_strength);
+    gpio_set_drive_strength(RFOUT_PIN+2, drive_strength);
+    gpio_set_drive_strength(RFOUT_PIN+3, drive_strength);
+    //*****************
 
 	dallas_setup();  //configures one-wire interface. Enabled pullup on one-wire gpio. must do this here, in case they want to use analog instead, because then pullup needs to be disabled below.
 
@@ -999,27 +1301,89 @@ void go_to_sleep()
 			{watchdog_enable(100, 1);for(;;)	{} }  //recovering from sleep is messy, so this makes it reboot to get a fresh start
 }
 ////////////////////////////////////
+/*
+kevin 10_30_24
+From Hans G0UPL  on 06/27/23 post #11140 (this is not documented elsewhere). We had been using a table-driven mapping before Hans posted his algo .
+ 
+The specification of U4B telemetry channels is as follows:
+ 
+First callsign character:
+Channels 0 - 199: '0'
+Channels 200-399: '1'
+Channels 400-599: 'Q'
+ 
+Third callsign character:
+(channel % 200) / 20
+ 
+Frequency discrimination:
+Frequency sector is
+(channel % 20) / 5
+ 
+That indicates into the array of transmit audio frequencies: {1420, 1460, 1540, 1580};
+which are the target transmit frequencies, each in their 5 sectors.
+Of course the actual transmit frequency is the standard WSPR USB dial frequency + the above mentioned audio frequency; USB dial frequencies:
+{136000, 474200, 1836600, 3568600, 5364700, 7038600, 10138700, 14095600, 18104600, 21094600, 24924600, 28124600, 50293000, 70091000, 144489000};
+ 
+Transmit slot:
+The transmit slot (txSlot) is first calculated as (channel % 5).
+Then the start time in minutes past the hour, repeated every 10 minutes, is given by:
+2 * ((txSlot + 2 * txBand) % 5);
+ 
+txBand is:
+0: 2200m
+1: 630m
+2: 160m
+3: 80m
+4: 60m
+5: 40m
+6: 30m
+7: 20m
+8: 17m
+9: 15m
+10: 12m
+11: 10m
+12: 6m
+13: 4m
+14: 2m
+*/
+ 
 void process_chan_num()
 {
 	if ( (atoi(_U4B_chan)>=0) && (atoi(_U4B_chan)<600)) 
 	{
 		
 		_id13[0]='1';
+        // Channels 0 - 199: '0'
+        // Channels 200-399: '1'
+        // Channels 400-599: 'Q'
 		if  (atoi(_U4B_chan)<200) _id13[0]='0';
 		if  (atoi(_U4B_chan)>399) _id13[0]='Q';
 
+        // (channel % 200) / 20
 		int id3 = (atoi(_U4B_chan) % 200) / 20;
 		_id13[1]=id3+'0';
 		
+        // Frequency discrimination:
+        // Frequency sector is
+        // (channel % 20) / 5
 		int lane = (atoi(_U4B_chan) % 20) / 5;
 		_lane[0]=lane+'1';
 
+        // The transmit slot (txSlot) is first calculated as (channel % 5).
+        // Then the start time in minutes past the hour, repeated every 10 minutes, is given by:
+        // 2 * ((txSlot + 2 * txBand) % 5);
 		int txSlot = atoi(_U4B_chan) % 5;
-		
-		_start_minute[0] = '0' + (2*((txSlot+14)%5));
-		
-			
-
+        int txBand;
+        switch(atoi(_Band))
+        {
+            case 20: txBand = 7;  break; // 20m
+            case 17: txBand = 8;  break; // 17m
+            case 15: txBand = 9;  break; // 15m
+            case 12: txBand = 10; break; // 12m
+            case 10: txBand = 11; break; // 10m
+            default: txBand = 7;  break; // default to 20M in case of error cases
+        }
+		_start_minute[0] = '0' + (2 * ((txSlot + (txBand*2)) % 5));
 
 	}
 }
