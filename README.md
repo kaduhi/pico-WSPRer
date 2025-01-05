@@ -1,3 +1,11 @@
+This is the porting version of [https://github.com/EngineerGuy314/pico-WSPRer](https://github.com/EngineerGuy314/pico-WSPRer)
+
+- Use [my pico-fractional-pll](https://github.com/kaduhi/pico-fractional-pll) library instead of [RPiks's pico-hf-oscillator](https://github.com/RPiks/pico-hf-oscillator)
+- All the changes from the original code are surrounded by #ifdef or #ifndef USE_PICO_FRACTIONAL_PLL
+
+Since I haven't touched anything below content, it may includes wrong links or statements.
+
+Kazuhisa "Kazu." Terasaki
 
 
 

@@ -13,6 +13,9 @@
 #include "hardware/rtc.h" 
 #include "hardware/watchdog.h"
 #include "pico/multicore.h"
+#ifdef USE_PICO_FRACTIONAL_PLL
+#include "pico_fractional_pll.h"
+#endif
 
 static char grid5;
 static char grid6;
@@ -47,6 +50,9 @@ const int8_t valid_dbm[19] =
 extern char _band_hop[2];         //"extern" is a sneaky and lazy way to get access to global variables in main.c.  shhhh.. don't tell the "professional"  programmers i used it...
 extern uint32_t XMIT_FREQUENCY;
 extern uint32_t XMIT_FREQUENCY_10_METER;
+#ifdef USE_PICO_FRACTIONAL_PLL
+extern int RFOUT_PIN;
+#endif
 
 
 static void sleep_callback(void) {
@@ -231,9 +237,19 @@ else
 							if(forced_xmit_in_process==0)
 							{
 								StampPrintf("> FORCING XMISSION! for debugging   <"); pctx->_txSched.led_mode = 4; 
+#ifndef USE_PICO_FRACTIONAL_PLL
 								PioDCOStart(pctx->_pTX->_p_oscillator);
 								//WSPRbeaconCreatePacket(pctx,0);    If this is disabled, the packet is all zeroes, and it xmits an unmodulated steady frequency. but if you didnt power cycle since enabling Force_xmition there will still be data stuck in the buffer...
 								sleep_ms(100); 
+#else
+								uint32_t freq_low = pctx->_pTX->_u32_dialfreqhz - 100;
+								uint32_t freq_high = pctx->_pTX->_u32_dialfreqhz + 300;
+								if (pico_fractional_pll_init(pll_sys, RFOUT_PIN, freq_low, freq_high, GPIO_DRIVE_STRENGTH_12MA, GPIO_SLEW_RATE_FAST) != 0) {
+									StampPrintf("pico_fractional_pll_init failed!! Halted.");
+									for (;;) { }
+								}
+								pico_fractional_pll_enable_output(true);
+#endif
 								WSPRbeaconSendPacket(pctx);
 								start_time = get_absolute_time();       
 								forced_xmit_in_process=1;
@@ -241,7 +257,12 @@ else
 								else if(absolute_time_diff_us( start_time, get_absolute_time()) > 120000000ULL) 
 								{
 									forced_xmit_in_process=0; //restart after 2 mins
+#ifndef USE_PICO_FRACTIONAL_PLL
 									PioDCOStop(pctx->_pTX->_p_oscillator); 
+#else
+									pico_fractional_pll_enable_output(false);
+									pico_fractional_pll_deinit();
+#endif
 									printf("Pio *STOP*  called by end of forced xmit. small pause before restart\n");
 									sleep_ms(2000);
 								}								
@@ -268,7 +289,12 @@ else
 		if (pctx->_txSched.oscillatorOff && schedule[(current_minute+9)%10]==-1)    // if we want to switch oscillator off and are in non sheduled interval 
 		{
 			transmitter_status=0; 
+#ifndef USE_PICO_FRACTIONAL_PLL
 			PioDCOStop(pctx->_pTX->_p_oscillator);	// Stop the oscilator
+#else
+			pico_fractional_pll_enable_output(false);
+			pico_fractional_pll_deinit();
+#endif
 		}
 	}
 	
@@ -284,7 +310,17 @@ else
 				else
 				pctx->_pTX->_u32_dialfreqhz = XMIT_FREQUENCY;
 
+#ifndef USE_PICO_FRACTIONAL_PLL
 			PioDCOStart(pctx->_pTX->_p_oscillator); 
+#else
+			uint32_t freq_low = pctx->_pTX->_u32_dialfreqhz - 100;
+			uint32_t freq_high = pctx->_pTX->_u32_dialfreqhz + 300;
+			if (pico_fractional_pll_init(pll_sys, RFOUT_PIN, freq_low, freq_high, GPIO_DRIVE_STRENGTH_12MA, GPIO_SLEW_RATE_FAST) != 0) {
+				StampPrintf("pico_fractional_pll_init failed!! Halted.");
+				for (;;) { }
+			}
+			pico_fractional_pll_enable_output(true);
+#endif
 			transmitter_status=1;
 			WSPRbeaconCreatePacket(pctx, schedule[current_minute] ); //the schedule determines packet type (1-4 for U4B 1st msg,U4B 2nd msg,Zachtek 1st, Zachtek 2nd)
 			sleep_ms(50);
@@ -321,7 +357,11 @@ else
 			datetime_t alarm_time = t;
 			alarm_time.min += (46-3);	//sleep for 55 minutes. 46 ~= 55 mins X (115Mhz/133Mhz)  // the -3 is to allow 1 TELEN in low power mode
 			gpio_set_irq_enabled(GPS_PPS_PIN, GPIO_IRQ_EDGE_RISE, false); //this is needed to disable IRQ callback on PPS
+#ifndef USE_PICO_FRACTIONAL_PLL
 			multicore_reset_core1();  //this is needed, otherwise causes instant reboot
+#else
+			pico_fractional_pll_deinit();
+#endif
 			sleep_run_from_dormant_source(DORMANT_SOURCE_ROSC);  //this reduces sleep draw to 2mA! (without this will still sleep, but only at 8mA)
 			sleep_goto_sleep_until(&alarm_time, &sleep_callback);	//blocks here during sleep perfiod
 			{watchdog_enable(100, 1);for(;;)	{} }  //recovering from sleep is messy, this makes it reboot to get a fresh start

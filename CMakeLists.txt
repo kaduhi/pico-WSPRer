@@ -60,6 +60,14 @@ target_include_directories(pico-WSPRer PRIVATE
                            ${CMAKE_CURRENT_LIST_DIR}/..
                           )
 
+target_compile_definitions(pico-WSPRer PUBLIC
+                           USE_PICO_FRACTIONAL_PLL
+                          )
+
+add_subdirectory(
+                 ${CMAKE_CURRENT_LIST_DIR}/pico-fractional-pll
+                )
+
 target_link_libraries(pico-WSPRer
                       pico_stdlib
                       pico_sync
@@ -72,6 +80,7 @@ target_link_libraries(pico-WSPRer
 					  hardware_sync
 					  hardware_i2c
 					  hardware_sleep
+            pico_fractional_pll
                      )
 
 pico_add_extra_outputs(pico-WSPRer)

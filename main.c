@@ -30,6 +30,9 @@
 #include "onewire/onewire_library.h"    // onewire library functions
 #include "onewire/ow_rom.h"             // onewire ROM command codes
 #include "onewire/ds18b20.h"            // ds18b20 function codes
+#ifdef USE_PICO_FRACTIONAL_PLL
+#include "pico_fractional_pll.h"
+#endif
 
 
 WSPRbeaconContext *pWSPR;
@@ -53,7 +56,11 @@ char _band_hop[2];
 static uint32_t telen_values[4];  //consolodate in an array to make coding easier
 static absolute_time_t LED_sequence_start_time;
 static int GPS_PPS_PIN;     //these get set based on values in defines.h, and also if custom PCB selected in user menu
+#ifndef USE_PICO_FRACTIONAL_PLL
 static int RFOUT_PIN;
+#else
+int RFOUT_PIN;
+#endif
 static int GPS_ENABLE_PIN;
 int PLL_SYS_MHZ;
 uint gpio_for_onewire;
@@ -119,7 +126,11 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 		
 	InitPicoPins();				// Sets GPIO pins roles and directions and also ADC for voltage and temperature measurements (NVRAM must be read BEFORE this, otherwise dont know how to map IO)
 	sleep_ms(2);						//when GPS is enabled it makes 3v3 sag momentarily. the rp2040 is less tolerant of this when overclocked. So, changed it to enable GPS, then  pause, and only then enable overclocking (vs other way around as before)
+#ifndef USE_PICO_FRACTIONAL_PLL
 	InitPicoClock(PLL_SYS_MHZ);			    // Sets the system clock generator	
+#else
+	set_sys_clock_48mhz();	// deinit pll_sys and only use pll_usb
+#endif
 	I2C_init();
     printf("\nThe pico-WSPRer version: %s %s\nWSPR beacon init...",__DATE__ ,__TIME__);	//messages are sent to USB serial port, 115200 baud
 
@@ -155,8 +166,10 @@ if (check_data_validity()==-1)  //if data was bad, breathe LED for 10 seconds an
 	pWB->_txSched.low_power_mode=(uint8_t)_battery_mode[0]-'0';
 	strcpy(pWB->_txSched.id13,_id13);
 
+#ifndef USE_PICO_FRACTIONAL_PLL
 	multicore_launch_core1(Core1Entry);    
     StampPrintf("RF oscillator initialized.");
+#endif
 	int uart_number=(uint8_t)_custom_PCB[0]-'0';  //custom PCB uses Uart 1 if selected, otherwise uart 0
 	DCO._pGPStime = GPStimeInit(uart_number, 9600, GPS_PPS_PIN, PLL_SYS_MHZ); //the 0 defines uart0, so the RX is GPIO 1 (pin 2 on pico). TX to GPS module not needed
     assert_(DCO._pGPStime);
@@ -502,7 +515,11 @@ strncpy(_custom_PCB, flash_target_contents+13, 1);
 strncpy(_DEXT_config, flash_target_contents+14, 4); //only needs 3, kept at 4 for historical ease
 strncpy(_battery_mode, flash_target_contents+18, 1);
 strncpy(_Klock_speed, flash_target_contents+19, 3); _Klock_speed[3]=0; //null terminate cause later will use atoi
+#ifndef USE_PICO_FRACTIONAL_PLL
 PLL_SYS_MHZ =atoi(_Klock_speed); 
+#else
+PLL_SYS_MHZ = 48; // force to override for pico-fractional-pll
+#endif
 strncpy(_Datalog_mode, flash_target_contents+22, 1);
 strncpy(_U4B_chan, flash_target_contents+23, 3); _U4B_chan[3]=0; //null terminate cause later will use atoi
 strncpy(_band_hop, flash_target_contents+26, 1);
@@ -1031,7 +1048,11 @@ void go_to_sleep()
 			//alarm_time.sec += 15;
 
 			gpio_set_irq_enabled(GPS_PPS_PIN, GPIO_IRQ_EDGE_RISE, false); //this is needed to disable IRQ callback on PPS
+#ifndef USE_PICO_FRACTIONAL_PLL
 			multicore_reset_core1();  //this is needed, otherwise causes instant reboot
+#else
+			pico_fractional_pll_deinit();
+#endif
 			sleep_run_from_dormant_source(DORMANT_SOURCE_ROSC);  //this reduces sleep draw to 2mA! (without this will still sleep, but only at 8mA)
 			sleep_goto_sleep_until(&alarm_time, &sleep_callback);	//blocks here during sleep perfiod
 			{watchdog_enable(100, 1);for(;;)	{} }  //recovering from sleep is messy, so this makes it reboot to get a fresh start

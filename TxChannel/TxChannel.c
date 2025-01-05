@@ -48,6 +48,9 @@
 //  THE SOFTWARE.
 ///////////////////////////////////////////////////////////////////////////////
 #include "TxChannel.h"
+#ifdef USE_PICO_FRACTIONAL_PLL
+#include "pico_fractional_pll.h"
+#endif
 
 static TxChannelContext *spTX = NULL;
 
@@ -72,9 +75,13 @@ static void RAM (TxChannelISR)(void)
                                          (uint64_t)(spTX->_u32_dialfreqhz * 1000LL));
             //compensate freqency shift using last symbol frequency
 
+#ifndef USE_PICO_FRACTIONAL_PLL
         PioDCOSetFreq(pDCO, spTX->_u32_dialfreqhz, 
                       (uint32_t)byte * WSPR_FREQ_STEP_MILHZ - 2 * i32_compensation_millis);
             //set the current symbol frequency
+#else
+        pico_fractional_pll_set_freq_f((float)spTX->_u32_dialfreqhz + (float)byte * 12000.f / 8192.f - (float)i32_compensation_millis / 1000.f);
+#endif
     }
 
     spTX->_tm_future_call += spTX->_bit_period_us; //next alarm calculation
